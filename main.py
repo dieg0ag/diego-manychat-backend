@@ -2,7 +2,7 @@
 Backend de cualificación inteligente para ManyChat.
 
 Integraciones:
-- Claude Haiku: análisis de intención y cualificación
+- OpenAI GPT-5.2: análisis de intención y cualificación
 - Notion: crea/actualiza leads en base "Leads ManyChat"
 - Calendly: detecta cuándo un lead ha agendado (webhook entrante)
 - ManyChat: sincroniza custom fields y tags
@@ -21,23 +21,41 @@ import re
 from datetime import datetime, timezone
 from typing import Literal
 
-import anthropic
 import httpx
+import openai
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 MANYCHAT_TOKEN = os.environ["MANYCHAT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "e51d9d2b-c58f-428c-b0ab-9804624e24dd")
+NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "bfa5ea4b-cef4-4381-9f2a-a08b0f4a1d57")
+CLIENTES_DS_ID = os.environ.get("CLIENTES_DS_ID", "31cc7b27-0542-81fe-a5d5-e57744aa7220")
+ONBOARDING_DS_ID = os.environ.get("ONBOARDING_DS_ID", "310c7b27-0542-80e8-86a2-ca7332bed187")
+ESTRATEGIAS_DS_ID = os.environ.get("ESTRATEGIAS_DS_ID", "310c7b27-0542-8096-aaa3-eed9b5349acb")
+REPORTES_DS_ID = os.environ.get("REPORTES_DS_ID", "310c7b27-0542-8049-bb5a-f3f0002814ca")
 BACKEND_SECRET = os.environ["BACKEND_SECRET"]
+
+MONTHS_ES = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Ocutibre", "Noviembre", "Diciembre",
+]
+
+ONBOARDING_CHECKLIST = [
+    ("FACTURA", "ADMINISTRATIVO"),
+    ("DATOS DEL CLIENTE", "ADMINISTRATIVO"),
+    ("FICHA NOTION", "ADMINISTRATIVO"),
+    ("METRICOOL", "ADMINISTRATIVO"),
+    ("DRIVE", "ADMINISTRATIVO"),
+]
 
 MANYCHAT_BASE = "https://api.manychat.com"
 NOTION_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 app = FastAPI(title="Diego Alvarez — ManyChat Qualifier")
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+llm = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ------------- Models -------------
@@ -74,6 +92,38 @@ class SyncLeadRequest(BaseModel):
 class CalendlyWebhook(BaseModel):
     event: str
     payload: dict
+
+
+class ActivateClientRequest(BaseModel):
+    subscriber_id: str | None = None
+    calendly_event_id: str | None = None
+    lead_page_id: str | None = None
+    name: str | None = None
+    email: str | None = None
+    instagram: str | None = None
+    phone: str | None = None
+    servicio: list[str] | None = None
+    precio_mensual: float | None = None
+    fecha_inicio: str | None = None
+    proxima_accion: str | None = None
+    origen: str | None = None
+    notas: str | None = None
+    auto_provision: bool = True
+
+
+class ProvisionRequest(BaseModel):
+    client_page_id: str
+    client_name: str | None = None
+    mes: str | None = None
+
+
+class MonthlyReportRequest(BaseModel):
+    client_page_id: str
+    client_name: str | None = None
+    mes: str | None = None
+    metricas: dict | None = None
+    highlights: list[str] | None = None
+    notas: str | None = None
 
 
 class ManyChatV2Response(BaseModel):
@@ -124,13 +174,16 @@ async def qualify(req: QualifyRequest, x_secret: str = Header(None)):
     )
     user_msg = f"{context}\n\nMensaje del lead:\n{req.message}"
 
-    response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
+    response = llm.chat.completions.create(
+        model=OPENAI_MODEL,
+        max_completion_tokens=400,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
     )
-    analysis = _extract_json(response.content[0].text)
+    analysis = _extract_json(response.choices[0].message.content)
     new_score = max(0, min(100, req.lead_score + int(analysis["score_delta"])))
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -185,8 +238,12 @@ async def calendly_webhook(body: CalendlyWebhook):
     invitee = body.payload
     email = invitee.get("email")
     name = invitee.get("name")
+    phone = invitee.get("text_reminder_number")
     questions = {q["question"]: q.get("answer") for q in invitee.get("questions_and_answers", [])}
     instagram = questions.get("Cuál es tu perfil de Instagram?") or questions.get("Cuál es tu perfil de Instagram? ")
+    scheduled_event = invitee.get("scheduled_event") or {}
+    event_uri = scheduled_event.get("uri") or invitee.get("uri") or ""
+    calendly_event_id = event_uri.rsplit("/", 1)[-1] if event_uri else None
 
     async with httpx.AsyncClient(timeout=15) as client:
         subscriber_id = await _find_manychat_subscriber_by_instagram(client, instagram) if instagram else None
@@ -202,7 +259,7 @@ async def calendly_webhook(body: CalendlyWebhook):
                 "Nombre": name,
                 "Email": email,
                 "Instagram": instagram,
-                "Telefono": questions.get("Numero de teléfono"),
+                "Telefono": questions.get("Numero de teléfono") or phone,
                 "Facturacion": _normalize_facturacion(questions.get("Facturación mensual (aproximada) * ")),
                 "Capacidad Inversion": _normalize_inversion(questions.get("¿Cuál es tu capacidad de inversión actual? ")),
                 "Status": "sql",
@@ -210,7 +267,106 @@ async def calendly_webhook(body: CalendlyWebhook):
                 "Llamada Agendada": True,
             },
         )
+
+        await _notion_upsert_client(
+            client,
+            dedup_key=("calendly", calendly_event_id) if calendly_event_id else ("email", email),
+            data={
+                "Nombre": name,
+                "Email": email,
+                "Instagram": instagram,
+                "Número de Teléfono": questions.get("Numero de teléfono") or phone,
+                "Pipeline": "Auditoría agendada",
+                "Origen": "Instagram ManyChat" if subscriber_id else "Directo",
+                "Calendly Event ID": calendly_event_id,
+                "Lead Origen ID": subscriber_id,
+            },
+        )
     return {"ok": True}
+
+
+@app.post("/activate-client")
+async def activate_client(req: ActivateClientRequest, x_secret: str = Header(None)):
+    _check_secret(x_secret)
+
+    if not any([req.calendly_event_id, req.subscriber_id, req.email, req.lead_page_id]):
+        raise HTTPException(400, "need one of: calendly_event_id, subscriber_id, email, lead_page_id")
+
+    if req.calendly_event_id:
+        dedup_key = ("calendly", req.calendly_event_id)
+    elif req.subscriber_id:
+        dedup_key = ("subscriber", req.subscriber_id)
+    elif req.email:
+        dedup_key = ("email", req.email)
+    else:
+        dedup_key = ("page_id", req.lead_page_id)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        page = await _notion_upsert_client(
+            client,
+            dedup_key=dedup_key,
+            data={
+                "Nombre": req.name,
+                "Email": req.email,
+                "Instagram": req.instagram,
+                "Número de Teléfono": req.phone,
+                "Pipeline": "Activo",
+                "Origen": req.origen or "Instagram ManyChat",
+                "Servicio": req.servicio,
+                "Precio Mensual": req.precio_mensual,
+                "Fecha Inicio": req.fecha_inicio,
+                "Próxima Acción": req.proxima_accion,
+                "Lead Origen ID": req.subscriber_id,
+                "Calendly Event ID": req.calendly_event_id,
+                "Notas Internas": req.notas,
+            },
+        )
+
+        provisioned = {}
+        if req.auto_provision and page.get("id"):
+            provisioned["onboarding"] = await _notion_provision_onboarding(
+                client, client_page_id=page["id"], client_name=req.name
+            )
+            provisioned["estrategia"] = await _notion_provision_estrategia(
+                client, client_page_id=page["id"], client_name=req.name
+            )
+
+        if req.subscriber_id:
+            await _manychat_add_tags(client, req.subscriber_id, ["status:cliente", "pipeline:activo"])
+            await _manychat_set_fields(client, req.subscriber_id, {"funnel_stage": "cliente"})
+
+    return {"ok": True, "notion_page_id": page.get("id"), "provisioned": provisioned}
+
+
+@app.post("/provision-onboarding")
+async def provision_onboarding(req: ProvisionRequest, x_secret: str = Header(None)):
+    _check_secret(x_secret)
+    async with httpx.AsyncClient(timeout=20) as client:
+        created = await _notion_provision_onboarding(
+            client, client_page_id=req.client_page_id, client_name=req.client_name
+        )
+    return {"ok": True, "created": created}
+
+
+@app.post("/provision-production")
+async def provision_production(req: ProvisionRequest, x_secret: str = Header(None)):
+    _check_secret(x_secret)
+    async with httpx.AsyncClient(timeout=20) as client:
+        created = await _notion_provision_estrategia(
+            client, client_page_id=req.client_page_id, client_name=req.client_name, mes=req.mes
+        )
+    return {"ok": True, "created": created}
+
+
+@app.post("/generate-monthly-report")
+async def generate_monthly_report(req: MonthlyReportRequest, x_secret: str = Header(None)):
+    _check_secret(x_secret)
+    mes = req.mes or _current_month_es()
+    narrative = _generate_report_narrative(req, mes) if (req.metricas or req.highlights) else None
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        page = await _notion_create_report_page(client, req, mes, narrative)
+    return {"ok": True, "notion_page_id": page.get("id"), "narrative": narrative}
 
 
 @app.get("/health")
@@ -227,7 +383,7 @@ def _check_secret(x_secret: str | None):
 def _extract_json(raw: str) -> dict:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
-        raise HTTPException(500, f"Claude no devolvió JSON: {raw[:200]}")
+        raise HTTPException(500, f"LLM no devolvió JSON: {raw[:200]}")
     return json.loads(match.group(0))
 
 
@@ -389,3 +545,229 @@ def _normalize_inversion(raw: str | None) -> str | None:
         return None
     m = {"1000€ o menos": "<1k", "2000€ - 4000€": "2-4k", "+5000€": "5k+"}
     return m.get(raw)
+
+
+# ------------- Clientes (CRM) -------------
+async def _notion_upsert_client(
+    client: httpx.AsyncClient,
+    dedup_key: tuple[str, str | None],
+    data: dict,
+) -> dict:
+    existing = await _notion_find_client(client, dedup_key)
+    props = _build_client_properties(data)
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    if existing:
+        r = await client.patch(
+            f"{NOTION_BASE}/pages/{existing}",
+            headers=headers,
+            json={"properties": props},
+        )
+    else:
+        r = await client.post(
+            f"{NOTION_BASE}/pages",
+            headers=headers,
+            json={"parent": {"database_id": CLIENTES_DS_ID}, "properties": props},
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+async def _notion_find_client(
+    client: httpx.AsyncClient,
+    dedup_key: tuple[str, str | None],
+) -> str | None:
+    kind, value = dedup_key
+    if not value:
+        return None
+
+    if kind == "page_id":
+        return value
+
+    filter_map = {
+        "calendly": {"property": "Calendly Event ID", "rich_text": {"equals": value}},
+        "subscriber": {"property": "Lead Origen ID", "rich_text": {"equals": value}},
+        "email": {"property": "Email", "email": {"equals": value}},
+    }
+    if kind not in filter_map:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    r = await client.post(
+        f"{NOTION_BASE}/databases/{CLIENTES_DS_ID}/query",
+        headers=headers,
+        json={"filter": filter_map[kind], "page_size": 1},
+    )
+    results = r.json().get("results", [])
+    return results[0]["id"] if results else None
+
+
+def _build_client_properties(data: dict) -> dict:
+    mapping = {
+        "Nombre": lambda v: {"title": [{"text": {"content": str(v)[:1900]}}]},
+        "Email": lambda v: {"email": v},
+        "Instagram": lambda v: {"url": v if str(v).startswith("http") else f"https://instagram.com/{str(v).lstrip('@')}"},
+        "Número de Teléfono": lambda v: {"phone_number": str(v)},
+        "Pipeline": lambda v: {"select": {"name": v}},
+        "Origen": lambda v: {"select": {"name": v}},
+        "Estado del Cliente": lambda v: {"select": {"name": v}},
+        "Servicio": lambda v: {"multi_select": [{"name": s} for s in (v if isinstance(v, list) else [v])]},
+        "Precio Mensual": lambda v: {"number": float(v)},
+        "Fecha Inicio": lambda v: {"date": {"start": v}},
+        "Próxima Acción": lambda v: {"date": {"start": v}},
+        "Lead Origen ID": lambda v: {"rich_text": [{"text": {"content": str(v)[:1900]}}]},
+        "Calendly Event ID": lambda v: {"rich_text": [{"text": {"content": str(v)[:1900]}}]},
+        "Notas Internas": lambda v: {"rich_text": [{"text": {"content": str(v)[:1900]}}]},
+        "Comentarios": lambda v: {"rich_text": [{"text": {"content": str(v)[:1900]}}]},
+    }
+    props: dict = {}
+    for key, value in data.items():
+        if value is None or value == "" or value == []:
+            continue
+        fn = mapping.get(key)
+        if fn:
+            props[key] = fn(value)
+    return props
+
+
+# ------------- Provisioning (Onboarding + Producción) -------------
+def _current_month_es() -> str:
+    return MONTHS_ES[datetime.now(timezone.utc).month - 1]
+
+
+async def _notion_create_page(client: httpx.AsyncClient, parent_ds: str, properties: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    r = await client.post(
+        f"{NOTION_BASE}/pages",
+        headers=headers,
+        json={"parent": {"database_id": parent_ds}, "properties": properties},
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+async def _notion_provision_onboarding(
+    client: httpx.AsyncClient,
+    client_page_id: str,
+    client_name: str | None,
+) -> list[str]:
+    created_ids: list[str] = []
+    display_name = client_name or "Cliente"
+    for tag, proceso in ONBOARDING_CHECKLIST:
+        props = {
+            "Name": {"title": [{"text": {"content": f"{tag} — {display_name}"}}]},
+            "Cliente": {"relation": [{"id": client_page_id}]},
+            "Multi-select": {"multi_select": [{"name": tag}]},
+            "Proceso": {"select": {"name": proceso}},
+            "Status": {"status": {"name": "Omboarding"}},
+            "Status 1": {"status": {"name": "Not started"}},
+        }
+        page = await _notion_create_page(client, ONBOARDING_DS_ID, props)
+        created_ids.append(page.get("id"))
+    return created_ids
+
+
+async def _notion_provision_estrategia(
+    client: httpx.AsyncClient,
+    client_page_id: str,
+    client_name: str | None,
+    mes: str | None = None,
+) -> list[str]:
+    display_name = client_name or "Cliente"
+    mes_name = mes or _current_month_es()
+    props = {
+        "Name": {"title": [{"text": {"content": f"Estrategia {mes_name} — {display_name}"}}]},
+        "Cliente": {"relation": [{"id": client_page_id}]},
+        "Proceso": {"select": {"name": "ESTRATEGIA"}},
+        "Status": {"status": {"name": "Estrategias y analisis"}},
+        "Mes": {"select": {"name": mes_name}},
+    }
+    page = await _notion_create_page(client, ESTRATEGIAS_DS_ID, props)
+    return [page.get("id")]
+
+
+def _generate_report_narrative(req: MonthlyReportRequest, mes: str) -> str:
+    metricas_txt = json.dumps(req.metricas or {}, ensure_ascii=False, indent=2)
+    highlights_txt = "\n".join(f"- {h}" for h in (req.highlights or [])) or "Ninguno"
+    system = (
+        "Eres el analista de contenido de Diego Alvarez. Redacta reportes mensuales para clientes de servicio DFY "
+        "de edición estratégica en Instagram. Tono: directo, en tú, sin rodeos, con foco en qué funcionó, qué no, "
+        "y qué haremos el próximo mes. 3 secciones: Resumen ejecutivo, Análisis, Plan próximo mes. Máximo 350 palabras."
+    )
+    user = (
+        f"Cliente: {req.client_name or 'Cliente'}\n"
+        f"Mes: {mes}\n"
+        f"Métricas:\n{metricas_txt}\n"
+        f"Highlights:\n{highlights_txt}\n"
+        f"Notas internas: {req.notas or 'sin notas'}"
+    )
+    response = llm.chat.completions.create(
+        model=OPENAI_MODEL,
+        max_completion_tokens=800,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _markdown_to_blocks(text: str) -> list[dict]:
+    blocks = []
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip()
+        if not line:
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": []}})
+            continue
+        if line.startswith("### "):
+            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": line[4:]}}]}})
+        elif line.startswith("## "):
+            blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": line[3:]}}]}})
+        elif line.startswith("# "):
+            blocks.append({"object": "block", "type": "heading_1", "heading_1": {"rich_text": [{"type": "text", "text": {"content": line[2:]}}]}})
+        elif line.startswith(("- ", "* ")):
+            blocks.append({"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": line[2:]}}]}})
+        else:
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]}})
+    return blocks[:95]
+
+
+async def _notion_create_report_page(
+    client: httpx.AsyncClient,
+    req: MonthlyReportRequest,
+    mes: str,
+    narrative: str | None,
+) -> dict:
+    display_name = req.client_name or "Cliente"
+    props = {
+        "Name": {"title": [{"text": {"content": f"Reporte {mes} — {display_name}"}}]},
+        "Cliente": {"relation": [{"id": req.client_page_id}]},
+        "Proceso": {"select": {"name": "ADMINISTRATIVO"}},
+        "Status": {"status": {"name": "REPORTES Y SEGUIMIENTOS"}},
+        "Mes": {"select": {"name": mes}},
+    }
+    body = {"parent": {"database_id": REPORTES_DS_ID}, "properties": props}
+    if narrative:
+        body["children"] = _markdown_to_blocks(narrative)
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    r = await client.post(f"{NOTION_BASE}/pages", headers=headers, json=body)
+    r.raise_for_status()
+    return r.json()
