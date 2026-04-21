@@ -24,7 +24,7 @@ from typing import Literal
 import httpx
 import openai
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, model_validator
 
 MANYCHAT_TOKEN = os.environ["MANYCHAT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -60,14 +60,31 @@ llm = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------- Models -------------
 class QualifyRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
-    subscriber_id: str = Field(validation_alias=AliasChoices("subscriber_id", "id"))
-    message: str = Field(validation_alias=AliasChoices("message", "last_input_text"))
+    subscriber_id: str
+    message: str = ""
     niche: str | None = None
     goal: str | None = None
     lead_score: int = 0
     first_name: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_manychat(cls, data):
+        if not isinstance(data, dict):
+            return data
+        if "subscriber_id" not in data and "id" in data:
+            data["subscriber_id"] = str(data["id"])
+        if "message" not in data or data.get("message") is None:
+            data["message"] = data.get("last_input_text") or ""
+        cf = data.get("custom_fields") or {}
+        for key in ("niche", "goal", "lead_score"):
+            if data.get(key) is None and cf.get(key) is not None:
+                data[key] = cf[key]
+        if data.get("lead_score") is None:
+            data["lead_score"] = 0
+        return data
 
 
 class SyncLeadRequest(BaseModel):
