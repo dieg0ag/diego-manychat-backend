@@ -24,7 +24,7 @@ from typing import Literal
 import httpx
 import openai
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 MANYCHAT_TOKEN = os.environ["MANYCHAT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -60,8 +60,10 @@ llm = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------- Models -------------
 class QualifyRequest(BaseModel):
-    subscriber_id: str
-    message: str
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    subscriber_id: str = Field(validation_alias=AliasChoices("subscriber_id", "id"))
+    message: str = Field(validation_alias=AliasChoices("message", "last_input_text"))
     niche: str | None = None
     goal: str | None = None
     lead_score: int = 0
