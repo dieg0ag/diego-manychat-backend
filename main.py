@@ -364,6 +364,7 @@ async def qualify(req: QualifyRequest, x_secret: str = Header(None)):
         ],
     )
     analysis = _extract_json(response.choices[0].message.content)
+    analysis["personal_reply"] = _sanitize_reply(analysis.get("personal_reply", ""))
     new_score = max(0, min(100, req.lead_score + int(analysis["score_delta"])))
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -574,6 +575,60 @@ def _action_to_tag(action: str) -> str:
         "nurturing": "accion:seguir_nurturing",
         "descartar": "status:no_interesado",
     }.get(action, "accion:seguir_nurturing")
+
+
+# Post-proc para limpiar anti-patrones que el modelo a veces ignora.
+_SANITIZE_JARGON = [
+    (r"\bDFY\b", "el servicio"),
+    (r"\bdone[- ]for[- ]you\b", "el servicio"),
+    (r"\bfunnel(s)?\b", "embudo"),
+    (r"\bCTA(s)?\b", "cierre"),
+    (r"\bKPI(s)?\b", "métrica"),
+    (r"\bICP\b", "cliente ideal"),
+    (r"\blead(s)?\s+magnet(s)?\b", "recurso gratis"),
+    (r"\bnurturing\b", "seguimiento"),
+    (r"\bpipeline\b", "flujo"),
+]
+
+# "Gracias por X" al inicio de la respuesta (permite nombre antes).
+_SANITIZE_GRACIAS = re.compile(
+    r"^(?P<prefix>\s*[A-Za-zÀ-ÿ]+[,:]?\s+)?[Gg]racias\s+por\s+"
+    r"(escrib[^,\.\s]*|tu\s+(mensaje|interés|interes)|contactar[^,\.\s]*|el\s+mensaje)"
+    r"[,\.!]?\s*",
+)
+
+# "opción más X / algo más X" — redirige a nurturing estándar.
+_SANITIZE_OPCION_BARATA = re.compile(
+    r"(te\s+digo\s+si\s+hay\s+)?(una\s+)?opci[oó]n\s+m[aá]s\s+(ligera|barata|accesible|reducida|econ[oó]mica)[^\.]*\.?",
+    re.IGNORECASE,
+)
+_SANITIZE_ALGO_MAS_BARATO = re.compile(
+    r"(te\s+paso\s+)?algo\s+m[aá]s\s+(ligero|barato|accesible|econ[oó]mico)[^\.]*\.?",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_reply(text: str) -> str:
+    if not text:
+        return text
+    text = _SANITIZE_GRACIAS.sub(lambda m: (m.group("prefix") or ""), text).lstrip()
+    # Si quedó "Nombre, Si..." tras eliminar "gracias por X", bajamos a minúscula la primera palabra tras la coma.
+    text = re.sub(
+        r"^(?P<prefix>[A-Za-zÀ-ÿ]+,\s+)(?P<first>[A-ZÀ-Ÿ])",
+        lambda m: m.group("prefix") + m.group("first").lower(),
+        text,
+    )
+    for pat, rep in _SANITIZE_JARGON:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+    text = _SANITIZE_OPCION_BARATA.sub(
+        "cuando el negocio esté listo para invertir en operación completa lo retomamos; mientras, te paso la clase gratis.",
+        text,
+    )
+    text = _SANITIZE_ALGO_MAS_BARATO.sub(
+        "te paso la clase gratis y lo retomamos cuando cuadre.",
+        text,
+    )
+    return text.strip()
 
 
 async def _manychat_set_fields(client: httpx.AsyncClient, subscriber_id: str, fields: dict):
