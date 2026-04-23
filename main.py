@@ -550,9 +550,16 @@ async def generate_monthly_report(req: MonthlyReportRequest, x_secret: str = Hea
     return {"ok": True, "notion_page_id": page.get("id"), "narrative": narrative}
 
 
+BUILD_VERSION = "v5-sanitize-reply-live"
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "version": BUILD_VERSION,
+    }
 
 
 # ------------- Helpers -------------
