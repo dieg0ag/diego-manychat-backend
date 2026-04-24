@@ -153,6 +153,31 @@ class ManyChatV2Response(BaseModel):
 SYSTEM_PROMPT = """Eres Diego Álvarez (@thediegoalvarezz) respondiendo por DM en Instagram. No eres un bot ni un asistente. Eres Diego. Respondes en primera persona, tú, español de España, directo, premium, sin humo, sin formalidades y sin emojis excesivos.
 
 ===========================
+PRIMER PASO: CLASIFICA EL CONTACTO
+===========================
+
+ANTES de escribir respuesta, clasifica el mensaje en UNO de estos 5 tipos. El tipo decide el tono y si hay pitch o no:
+
+1) "lead" — intención comercial (explícita o implícita). Pregunta por servicios/precio/ayuda, menciona facturación, describe fricción de negocio, pide info. → Flujo cualificación estándar.
+
+2) "cliente" — persona que YA trabaja contigo / ECSSTUDIO. Habla con familiaridad operativa sobre proyectos en curso: guiones, reels pendientes, reuniones, facturas, feedback, fechas de grabación, entregables. Señales típicas: "¿viste el guión X?", "¿cuándo me pasas el reel?", "no me ha llegado la factura", "¿a qué hora la reunión?", "la edición del último quedó genial", "necesito el reel para mañana". → Responde como socio operativo. CERO pitch, CERO Calendly.
+
+3) "amigo_casual" — amigo, colega o conocido que escribe por relación personal, sin intención comercial. Tono informal, broma, meme, emoji-only, referencia a algo compartido. Señales: "ey máquina", "jajaja qué bueno", "tronco 😂", "hombre!", "te vi en X qué crack", reacción casual a stories/reels. → Responde en el MISMO tono casual. CERO pitch, CERO clase gratis, CERO Calendly.
+
+4) "broma_saludo" — saludo suelto sin historial, sin pregunta comercial. "Hola", "buenas", "qué tal?", meme o reacción de desconocido. → Saludo breve y natural, abriendo a que cuente. CERO pitch forzado.
+
+5) "no_comercial" — pregunta concreta que no busca contratar. Curiosidad técnica ("¿qué cámara usas?", "¿con qué editas?"), pregunta random no comercial. → Responde la pregunta directo. CERO intento de convertir en venta.
+
+Regla de oro: si hay DUDA razonable sobre intención comercial → clasifica como "lead". Pero NUNCA fuerces pitch sobre cliente, amigo, broma o pregunta no comercial. Eso suena a bot y quema la relación.
+
+EJEMPLOS RÁPIDOS:
+- "Diego, ¿viste mi feedback del guión 3? ¿cuándo grabamos?" → cliente → "lo miro ahora y te digo en un rato".
+- "jajaja el reel del barbero es oro" → amigo_casual → "jajaja gracias tronco 😂".
+- "buenas 👋" → broma_saludo → "ey, ¿qué tal? cuéntame".
+- "¿con qué editas tus reels?" → no_comercial → "Premiere + After. ¿Lo preguntas por algo concreto?"
+- "facturo 10k con mi consultoría y mi contenido no convierte" → lead → flujo MOFU/BOFU.
+
+===========================
 QUIÉN ERES Y QUÉ VENDES
 ===========================
 
@@ -308,27 +333,34 @@ FORMATO DE SALIDA (JSON ESTRICTO)
 
 Devuelve SOLO JSON válido con esta estructura exacta:
 {
+  "contact_type": "lead"|"cliente"|"amigo_casual"|"broma_saludo"|"no_comercial",
   "score_delta": int entre -10 y +40,
   "objection": "precio"|"tiempo"|"confianza"|"no_urgencia"|"ninguna",
-  "funnel_stage": "TOFU"|"MOFU"|"BOFU",
-  "next_action": "agendar_llamada"|"enviar_clase"|"nurturing"|"descartar",
-  "personal_reply": respuesta como Diego real en DM, 2-4 frases máximo, que responda LO QUE DIJERON y mueva al siguiente paso natural del embudo
+  "funnel_stage": "TOFU"|"MOFU"|"BOFU"|"NO_APLICA",
+  "next_action": "agendar_llamada"|"enviar_clase"|"nurturing"|"descartar"|"atender_cliente"|"responder_casual",
+  "personal_reply": respuesta como Diego real en DM, 2-4 frases máximo, que responda LO QUE DIJERON y mueva al siguiente paso natural del embudo (o cierre casual si no es lead)
 }
 
-Reglas de score:
+Reglas según contact_type:
+- Si contact_type != "lead": score_delta=0, objection="ninguna", funnel_stage="NO_APLICA".
+- contact_type == "cliente" → next_action="atender_cliente". Respuesta operativa, sin pitch.
+- contact_type in ("amigo_casual","broma_saludo","no_comercial") → next_action="responder_casual". Respuesta casual, sin pitch.
+- contact_type == "lead" → aplica reglas de score / funnel / next_action de abajo.
+
+Reglas de score (solo para lead):
 - Menciona dinero/presupuesto/ROI/facturación concreta → BOFU, +30
 - Ya vende y pide ayuda concreta / pide info de servicio → MOFU/BOFU, +25
 - Curiosidad general sin contexto de negocio → TOFU, 0
 - Empieza desde cero sin negocio, sin facturación → TOFU, -5
 - Descalificación clara (sin negocio real, busca postureo) → descartar, -10
 
-Reglas de objeción:
+Reglas de objeción (solo para lead):
 - "caro/precio/no puedo pagar/presupuesto" → precio
 - "sin tiempo/ocupado/más adelante" → tiempo
 - "¿funciona?/¿resultados?/garantía/ejemplos" → confianza
 - "luego/algún día/no es momento" → no_urgencia
 
-Reglas de next_action:
+Reglas de next_action (solo para lead):
 - BOFU claro → agendar_llamada
 - TOFU/MOFU con interés → enviar_clase o nurturing
 - Descalificado → descartar
@@ -365,7 +397,30 @@ async def qualify(req: QualifyRequest, x_secret: str = Header(None)):
     )
     analysis = _extract_json(response.choices[0].message.content)
     analysis["personal_reply"] = _sanitize_reply(analysis.get("personal_reply", ""))
-    new_score = max(0, min(100, req.lead_score + int(analysis["score_delta"])))
+
+    contact_type = analysis.get("contact_type", "lead")
+    if contact_type not in {"lead", "cliente", "amigo_casual", "broma_saludo", "no_comercial"}:
+        contact_type = "lead"
+
+    # Si no es lead, no tocamos score/objeción/embudo — respetamos valores del contacto.
+    if contact_type == "lead":
+        new_score = max(0, min(100, req.lead_score + int(analysis.get("score_delta", 0))))
+        objection = analysis.get("objection", "ninguna")
+        funnel_stage = analysis.get("funnel_stage", "TOFU")
+        next_action = analysis.get("next_action", "nurturing")
+    else:
+        new_score = req.lead_score
+        objection = "ninguna"
+        funnel_stage = "NO_APLICA"
+        next_action = {
+            "cliente": "atender_cliente",
+            "amigo_casual": "responder_casual",
+            "broma_saludo": "responder_casual",
+            "no_comercial": "responder_casual",
+        }[contact_type]
+
+    action_tag = _action_to_tag(next_action)
+    type_tag = _contact_type_tag(contact_type)
 
     async with httpx.AsyncClient(timeout=15) as client:
         await _manychat_set_fields(
@@ -373,30 +428,38 @@ async def qualify(req: QualifyRequest, x_secret: str = Header(None)):
             req.subscriber_id,
             {
                 "lead_score": new_score,
-                "objection_detected": analysis["objection"],
-                "funnel_stage": analysis["funnel_stage"],
+                "objection_detected": objection,
+                "funnel_stage": funnel_stage,
+                "contact_type": contact_type,
             },
         )
-        await _notion_upsert_lead(
-            client,
-            subscriber_id=req.subscriber_id,
-            data={
-                "Lead Score": new_score,
-                "Objecion": analysis["objection"],
-                "Funnel Stage": analysis["funnel_stage"],
-                "Notas": req.message[:1900],
-            },
-        )
+        # Solo persistimos en Notion si es un lead — clientes/amigos no van al CRM de leads.
+        if contact_type == "lead":
+            await _notion_upsert_lead(
+                client,
+                subscriber_id=req.subscriber_id,
+                data={
+                    "Lead Score": new_score,
+                    "Objecion": objection,
+                    "Funnel Stage": funnel_stage,
+                    "Notas": req.message[:1900],
+                },
+            )
+
+    actions = [
+        {"action": "set_field_value", "field_name": "lead_score", "value": new_score},
+        {"action": "set_field_value", "field_name": "objection_detected", "value": objection},
+        {"action": "set_field_value", "field_name": "funnel_stage", "value": funnel_stage},
+        {"action": "set_field_value", "field_name": "contact_type", "value": contact_type},
+        {"action": "add_tag", "tag_name": action_tag},
+    ]
+    if type_tag:
+        actions.append({"action": "add_tag", "tag_name": type_tag})
 
     return ManyChatV2Response(
         content={
             "messages": [{"type": "text", "text": analysis["personal_reply"]}],
-            "actions": [
-                {"action": "set_field_value", "field_name": "lead_score", "value": new_score},
-                {"action": "set_field_value", "field_name": "objection_detected", "value": analysis["objection"]},
-                {"action": "set_field_value", "field_name": "funnel_stage", "value": analysis["funnel_stage"]},
-                {"action": "add_tag", "tag_name": _action_to_tag(analysis["next_action"])},
-            ],
+            "actions": actions,
         }
     )
 
@@ -550,7 +613,7 @@ async def generate_monthly_report(req: MonthlyReportRequest, x_secret: str = Hea
     return {"ok": True, "notion_page_id": page.get("id"), "narrative": narrative}
 
 
-BUILD_VERSION = "v5-sanitize-reply-live"
+BUILD_VERSION = "v6-contact-type-classifier"
 
 
 @app.get("/health")
@@ -581,7 +644,19 @@ def _action_to_tag(action: str) -> str:
         "enviar_clase": "accion:enviar_recurso",
         "nurturing": "accion:seguir_nurturing",
         "descartar": "status:no_interesado",
+        "atender_cliente": "accion:atender_cliente",
+        "responder_casual": "accion:responder_casual",
     }.get(action, "accion:seguir_nurturing")
+
+
+def _contact_type_tag(contact_type: str) -> str | None:
+    return {
+        "lead": None,
+        "cliente": "tipo:cliente",
+        "amigo_casual": "tipo:amigo",
+        "broma_saludo": "tipo:saludo",
+        "no_comercial": "tipo:no_comercial",
+    }.get(contact_type, None)
 
 
 # Post-proc para limpiar anti-patrones que el modelo a veces ignora.
