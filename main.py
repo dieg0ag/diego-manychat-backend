@@ -519,10 +519,14 @@ async def qualify(req: QualifyRequest, x_secret: str = Header(None)):
     )
     user_msg = f"{context}\n\nMensaje del lead:\n{req.message}"
 
+    # max_completion_tokens=400 para mantenernos por debajo del timeout de 10s
+    # que ManyChat aplica a external requests. El JSON de salida real son
+    # ~150-250 tokens; 400 da margen sin alargar la generación inútilmente.
     response = llm.chat.completions.create(
         model=OPENAI_MODEL,
-        max_completion_tokens=800,
+        max_completion_tokens=400,
         response_format={"type": "json_object"},
+        timeout=8.5,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
